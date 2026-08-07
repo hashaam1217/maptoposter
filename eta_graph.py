@@ -11,17 +11,21 @@ Traffic-aware providers (one API key required):
   - TomTom Routing API   (env: TOMTOM_API_KEY,      https://developer.tomtom.com)
   - Google Directions API (env: GOOGLE_MAPS_API_KEY, requires billing-enabled key)
 
-A --demo mode generates synthetic traffic data so the graph can be previewed
-without an API key.
+Keyless providers (no signup needed):
+  - estimate: real route + base drive time from the public OSRM server, shaped
+    by a typical rush-hour congestion profile (estimated, not live traffic)
+  - demo: fully synthetic data for previewing the graph offline
 """
 
 import argparse
+import functools
 import math
 import os
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -37,6 +41,7 @@ SECONDS_BETWEEN_REQUESTS = 0.25
 
 TOMTOM_ROUTING_URL = "https://api.tomtom.com/routing/1/calculateRoute/{locations}/json"
 GOOGLE_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
+OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving/{coords}"
 
 # Chart styling: one series -> one hue; recessive grid/axes; ink for text.
 LINE_COLOR = "#2563EB"
@@ -167,29 +172,74 @@ def fetch_eta_google(origin, destination, departure: datetime, api_key: str) -> 
     return duration["value"]
 
 
+def typical_congestion_multiplier(departure: datetime) -> float:
+    """
+    Multiplier over free-flow drive time from a typical urban traffic pattern.
+
+    Weekdays get morning and evening rush-hour peaks; weekends a gentler
+    midday bump. This is a model of typical conditions, not live traffic.
+    """
+    hour = departure.hour + departure.minute / 60.0
+    if departure.weekday() >= 5:
+        midday = 0.30 * math.exp(-((hour - 14.0) ** 2) / 8.0)
+        return 1.0 + midday
+    morning = 0.55 * math.exp(-((hour - 8.25) ** 2) / 1.8)
+    evening = 0.75 * math.exp(-((hour - 17.5) ** 2) / 2.6)
+    return 1.0 + morning + evening
+
+
+@functools.lru_cache(maxsize=8)
+def fetch_osrm_base(origin: tuple, destination: tuple) -> float:
+    """
+    Fetch the real-route drive time from the public OSRM demo server (no key).
+
+    OSRM has no traffic data, so the result does not depend on departure time;
+    it is fetched once per point pair and cached.
+
+    :return: Free-flow travel time in seconds
+    """
+    coords = f"{origin[1]},{origin[0]};{destination[1]},{destination[0]}"
+    response = requests.get(OSRM_ROUTE_URL.format(coords=coords),
+                            params={"overview": "false"}, timeout=REQUEST_TIMEOUT_SECONDS)
+    if response.status_code != 200:
+        raise RoutingError(f"OSRM error {response.status_code}: {response.text[:300]}")
+    data = response.json()
+    if data.get("code") != "Ok" or not data.get("routes"):
+        raise RoutingError(f"OSRM returned '{data.get('code')}': no route between these points.")
+    return data["routes"][0]["duration"]
+
+
+def fetch_eta_estimate(origin, destination, departure: datetime, api_key: str) -> float:
+    """
+    Keyless estimate: real OSRM route time shaped by typical congestion.
+
+    The base drive time comes from the actual road route (public OSRM server);
+    the variation by departure time is a typical rush-hour model, not live data.
+    """
+    return fetch_osrm_base(tuple(origin), tuple(destination)) * typical_congestion_multiplier(departure)
+
+
 def fetch_eta_demo(origin, destination, departure: datetime, api_key: str) -> float:
     """
-    Generate a synthetic ETA with morning and evening rush-hour peaks.
+    Generate a fully synthetic ETA for offline previews.
 
-    Used to preview the graph without an API key. Base drive time scales with
-    straight-line distance between the points.
+    Base drive time scales with straight-line distance between the points.
     """
     lat_km = (destination[0] - origin[0]) * 111.0
     lon_km = (destination[1] - origin[1]) * 111.0 * math.cos(math.radians(origin[0]))
     distance_km = max(math.hypot(lat_km, lon_km), 1.0)
     base_seconds = distance_km / 55.0 * 3600  # ~55 km/h average off-peak
-
-    hour = departure.hour + departure.minute / 60.0
-    morning = 0.55 * math.exp(-((hour - 8.25) ** 2) / 1.8)
-    evening = 0.75 * math.exp(-((hour - 17.5) ** 2) / 2.6)
-    return base_seconds * (1.0 + morning + evening)
+    return base_seconds * typical_congestion_multiplier(departure)
 
 
 PROVIDERS = {
     "tomtom": (fetch_eta_tomtom, "TOMTOM_API_KEY"),
     "google": (fetch_eta_google, "GOOGLE_MAPS_API_KEY"),
+    "estimate": (fetch_eta_estimate, None),
     "demo": (fetch_eta_demo, None),
 }
+
+ESTIMATED_PROVIDERS = {"estimate", "demo"}
 
 
 def collect_samples(origin, destination, departures, provider: str, api_key: str) -> list[EtaSample]:
@@ -206,7 +256,7 @@ def collect_samples(origin, destination, departures, provider: str, api_key: str
             samples.append(EtaSample(departure, seconds))
         except RoutingError as e:
             tqdm.write(f"  ⚠ {departure.strftime('%H:%M')}: {e}")
-        if provider != "demo":
+        if provider not in ESTIMATED_PROVIDERS:
             time.sleep(SECONDS_BETWEEN_REQUESTS)
     return samples
 
@@ -218,7 +268,7 @@ def format_minutes(minutes: float) -> str:
     return f"{int(round(minutes))} min"
 
 
-def plot_samples(samples, origin_label, destination_label, interval_minutes, output_path):
+def plot_samples(samples, origin_label, destination_label, interval_minutes, output_path, estimated=False):
     """
     Render the ETA vs. departure time graph and save it as a PNG.
 
@@ -250,8 +300,10 @@ def plot_samples(samples, origin_label, destination_label, interval_minutes, out
 
     ax.set_title(f"Drive time by departure time\n{origin_label}  →  {destination_label}",
                  fontsize=14, fontweight="bold", color=INK_PRIMARY, loc="left", pad=14)
-    ax.set_xlabel(f"Departure time ({times[0].strftime('%a %b %d')}, every {interval_minutes} min)",
-                  fontsize=10, color=INK_SECONDARY)
+    xlabel = f"Departure time ({times[0].strftime('%a %b %d')}, every {interval_minutes} min)"
+    if estimated:
+        xlabel += "  —  estimated from typical traffic patterns, not live data"
+    ax.set_xlabel(xlabel, fontsize=10, color=INK_SECONDARY)
     ax.set_ylabel("Drive time (minutes)", fontsize=10, color=INK_SECONDARY)
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=times[0].tzinfo))
@@ -290,7 +342,7 @@ def print_summary(samples, origin_label, destination_label):
     print(f"Leaving at the best time saves up to {format_minutes(saved)}.")
 
 
-def parse_start(value: str | None, interval_minutes: int) -> datetime:
+def parse_start(value: str | None, interval_minutes: int, tz=None) -> datetime:
     """
     Determine the first departure time.
 
@@ -298,8 +350,10 @@ def parse_start(value: str | None, interval_minutes: int) -> datetime:
     datetime ('2026-08-08T06:00') or a time ('06:00', meaning today/tomorrow).
     Providers reject past departure times, so times already passed roll forward
     one day.
+
+    :param tz: Timezone for departure times (ZoneInfo); default: system local
     """
-    now = datetime.now().astimezone()
+    now = datetime.now(tz) if tz else datetime.now().astimezone()
     if value is None:
         minutes_past = (now.minute % interval_minutes) * 60 + now.second
         start = now + timedelta(seconds=interval_minutes * 60 - minutes_past)
@@ -335,12 +389,22 @@ def main():
     parser.add_argument("--start", default=None,
                         help="First departure ('2026-08-08T06:00' or '06:00'); default: next interval from now")
     parser.add_argument("--provider", choices=sorted(PROVIDERS), default=None,
-                        help="Routing provider; default: auto-detect from available API keys")
+                        help="Routing provider; default: auto-detect from available API keys, "
+                             "falling back to the keyless 'estimate' provider")
+    parser.add_argument("--tz", default=None,
+                        help="IANA timezone for departure times (e.g. America/Vancouver); default: system local")
     parser.add_argument("--output", "-o", default=None, help="Output PNG path")
     args = parser.parse_args()
 
     if args.interval < 1:
         raise SystemExit("--interval must be at least 1 minute.")
+
+    tz = None
+    if args.tz:
+        try:
+            tz = ZoneInfo(args.tz)
+        except KeyError:
+            raise SystemExit(f"Unknown timezone '{args.tz}'. Use an IANA name like America/Vancouver.")
 
     provider = args.provider
     if provider is None:
@@ -349,10 +413,10 @@ def main():
                 provider = name
                 break
         else:
-            raise SystemExit(
-                "No API key found. Set TOMTOM_API_KEY (free key: https://developer.tomtom.com) or "
-                "GOOGLE_MAPS_API_KEY, or run with '--provider demo' to preview with synthetic traffic."
-            )
+            provider = "estimate"
+            print("No TOMTOM_API_KEY or GOOGLE_MAPS_API_KEY found — using the keyless 'estimate' provider:\n"
+                  "real route and base drive time from OSRM, shaped by typical rush-hour patterns "
+                  "(not live traffic).")
 
     _, env_var = PROVIDERS[provider]
     api_key = os.environ.get(env_var) if env_var else None
@@ -365,7 +429,7 @@ def main():
     except RoutingError as e:
         raise SystemExit(str(e))
 
-    start = parse_start(args.start, args.interval)
+    start = parse_start(args.start, args.interval, tz)
     departures = build_departures(start, args.hours, args.interval)
     print(f"Sampling {len(departures)} departure times from "
           f"{start.strftime('%a %b %d %H:%M')} every {args.interval} min ({provider}).")
@@ -381,7 +445,8 @@ def main():
         os.makedirs(ETA_GRAPHS_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = os.path.join(ETA_GRAPHS_DIR, f"eta_{stamp}.png")
-    plot_samples(samples, origin[2], destination[2], args.interval, output_path)
+    plot_samples(samples, origin[2], destination[2], args.interval, output_path,
+                 estimated=provider in ESTIMATED_PROVIDERS)
     print(f"\nGraph saved to: {output_path}")
 
 
