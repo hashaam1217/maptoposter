@@ -233,6 +233,44 @@ Posters are saved to `posters/` directory with format:
 {city}_{theme}_{YYYYMMDD_HHMMSS}.png
 ```
 
+## ETA Graph — Find the Best Time to Leave
+
+`eta_graph.py` takes two points and queries a traffic-aware routing API for the driving ETA at
+regular departure intervals (every 30 minutes by default), then graphs drive time vs. departure
+time so you can see the best time to leave. Best and worst departures are highlighted on the
+graph and printed in a summary table.
+
+```bash
+# Points can be place names/addresses or "lat, lon" coordinates
+uv run ./eta_graph.py --from "Toronto, ON" --to "Waterloo, ON"
+
+# Sample tomorrow morning through evening at 15-minute resolution
+uv run ./eta_graph.py --from "43.6532, -79.3832" --to "43.4643, -80.5204" \
+    --start 06:00 --hours 16 --interval 15
+
+# Preview the graph with synthetic traffic (no API key needed)
+uv run ./eta_graph.py --from "Toronto, ON" --to "Waterloo, ON" --provider demo
+```
+
+Live traffic requires an API key from one provider (set as an environment variable):
+
+| Provider | Env variable | Notes |
+|----------|--------------|-------|
+| [TomTom](https://developer.tomtom.com) | `TOMTOM_API_KEY` | Free tier (2,500 requests/day) — recommended |
+| [Google Maps](https://developers.google.com/maps/documentation/directions) | `GOOGLE_MAPS_API_KEY` | Requires a billing-enabled key |
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--from` / `--to` | Points: place name/address or `"lat, lon"` | required |
+| `--interval` | Minutes between departure samples | 30 |
+| `--hours` | Length of the departure window in hours | 24 |
+| `--start` | First departure (`06:00` or `2026-08-08T06:00`) | next interval from now |
+| `--provider` | `tomtom`, `google`, or `demo` | auto-detect from API keys |
+| `--output`, `-o` | Output PNG path | `eta_graphs/eta_<timestamp>.png` |
+
+Note: OpenStreetMap routing has no traffic data, so ETAs would not vary by departure time —
+that's why a traffic-aware provider is needed for the real curve.
+
 ## Adding Custom Themes
 
 Create a JSON file in `themes/` directory:
@@ -260,6 +298,7 @@ Create a JSON file in `themes/` directory:
 ```text
 map_poster/
 ├── create_map_poster.py    # Main script
+├── eta_graph.py            # ETA vs. departure time grapher
 ├── font_management.py      # Font loading and Google Fonts integration
 ├── themes/                 # Theme JSON files
 ├── fonts/                  # Font files

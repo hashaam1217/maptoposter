@@ -1,5 +1,8 @@
 cache/*
 
+# ETA graph outputs
+eta_graphs/
+
 # Virtual environments
 env/
 .env/
