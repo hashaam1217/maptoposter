@@ -248,16 +248,20 @@ uv run ./eta_graph.py --from "Toronto, ON" --to "Waterloo, ON"
 uv run ./eta_graph.py --from "43.6532, -79.3832" --to "43.4643, -80.5204" \
     --start 06:00 --hours 16 --interval 15
 
-# Preview the graph with synthetic traffic (no API key needed)
-uv run ./eta_graph.py --from "Toronto, ON" --to "Waterloo, ON" --provider demo
+# No API key: real route time from OSRM + typical rush-hour profile (estimated)
+uv run ./eta_graph.py --from "V6T 1Z4" --to "1461 Venables Street, Vancouver" --tz America/Vancouver
 ```
 
-Live traffic requires an API key from one provider (set as an environment variable):
+With no API key set, the keyless `estimate` provider is used automatically: the real route and
+base drive time come from the public OSRM server, and the variation by departure time comes from
+a typical weekday/weekend congestion model (clearly labeled — not live traffic). For live traffic,
+set an API key for one provider:
 
 | Provider | Env variable | Notes |
 |----------|--------------|-------|
-| [TomTom](https://developer.tomtom.com) | `TOMTOM_API_KEY` | Free tier (2,500 requests/day) — recommended |
-| [Google Maps](https://developers.google.com/maps/documentation/directions) | `GOOGLE_MAPS_API_KEY` | Requires a billing-enabled key |
+| [TomTom](https://developer.tomtom.com) | `TOMTOM_API_KEY` | Live traffic; free tier (2,500 requests/day) |
+| [Google Maps](https://developers.google.com/maps/documentation/directions) | `GOOGLE_MAPS_API_KEY` | Live traffic; requires a billing-enabled key |
+| OSRM (`--provider estimate`) | none | Real route, estimated traffic pattern — the keyless default |
 
 | Option | Description | Default |
 |--------|-------------|---------|
@@ -265,7 +269,8 @@ Live traffic requires an API key from one provider (set as an environment variab
 | `--interval` | Minutes between departure samples | 30 |
 | `--hours` | Length of the departure window in hours | 24 |
 | `--start` | First departure (`06:00` or `2026-08-08T06:00`) | next interval from now |
-| `--provider` | `tomtom`, `google`, or `demo` | auto-detect from API keys |
+| `--provider` | `tomtom`, `google`, `estimate`, or `demo` | auto-detect keys, else `estimate` |
+| `--tz` | IANA timezone for departure times (e.g. `America/Vancouver`) | system local |
 | `--output`, `-o` | Output PNG path | `eta_graphs/eta_<timestamp>.png` |
 
 Note: OpenStreetMap routing has no traffic data, so ETAs would not vary by departure time —
